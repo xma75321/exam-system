@@ -39,6 +39,8 @@ services:
       dockerfile: ../docker/Dockerfile.backend
     container_name: exam-backend-prod
     restart: unless-stopped
+    ports:
+      - "8000:8000"
     environment:
       DATABASE_URL: mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@db:3306/${MYSQL_DATABASE:-exam_system}
       SECRET_KEY: ${SECRET_KEY}
@@ -71,14 +73,16 @@ services:
       dockerfile: ../docker/Dockerfile.frontend
     container_name: exam-frontend-prod
     restart: unless-stopped
+    ports:
+      - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: https://${DOMAIN}/api
+      NEXT_PUBLIC_API_URL: http://${DOMAIN}/api
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/"]
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 10s
     networks:
       - exam-network
     logging:
