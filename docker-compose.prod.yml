@@ -100,11 +100,8 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
-      - "443:443"
     volumes:
       - ./docker/nginx.prod.conf:/etc/nginx/nginx.conf:ro
-      - ./ssl:/etc/nginx/ssl:ro
-      - ./docker/ssl-params.conf:/etc/nginx/snippets/ssl-params.conf:ro
     depends_on:
       - frontend
       - backend
