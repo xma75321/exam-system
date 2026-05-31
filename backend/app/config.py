@@ -2,7 +2,9 @@
 应用配置管理，使用 pydantic-settings 从环境变量和 .env 文件加载配置。
 """
 
+import json
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 
 
 class Settings(BaseSettings):
@@ -21,6 +23,16 @@ class Settings(BaseSettings):
 
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError:
+                return [i.strip() for i in v.split(",")]
+        return v
 
     model_config = {
         "env_file": ".env",
