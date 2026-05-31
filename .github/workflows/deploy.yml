@@ -1,0 +1,198 @@
+name: CD - 持续部署
+
+on:
+  push:
+    tags:
+      - 'v*'  # 触发条件：推送版本标签，如 v1.0.0
+  workflow_dispatch:  # 允许手动触发
+    inputs:
+      environment:
+        description: '部署环境'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # 构建并推送 Docker 镜像
+  build-and-push:
+    name: 构建并推送镜像
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 登录 Docker Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 提取版本号
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=manual-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 构建并推送后端镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./docker/Dockerfile.backend
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}/backend:${{ steps.meta.outputs.version }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}/backend:latest
+
+      - name: 构建并推送前端镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./docker/Dockerfile.frontend
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}/frontend:${{ steps.meta.outputs.version }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}/frontend:latest
+
+  # 部署到 Staging
+  deploy-staging:
+    name: 部署到 Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event.inputs.environment == 'staging' || github.event_name == 'push'
+    environment:
+      name: staging
+      url: https://staging.yourdomain.com
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 部署到服务器
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            cd /opt/exam-system
+            
+            # 拉取最新代码
+            git pull origin main
+            
+            # 更新环境变量
+            echo "VERSION=${{ needs.build-and-push.outputs.version }}" > .env
+            echo "DOMAIN=staging.yourdomain.com" >> .env
+            echo "MYSQL_ROOT_PASSWORD=${{ secrets.MYSQL_ROOT_PASSWORD }}" >> .env
+            echo "MYSQL_USER=${{ secrets.MYSQL_USER }}" >> .env
+            echo "MYSQL_PASSWORD=${{ secrets.MYSQL_PASSWORD }}" >> .env
+            echo "SECRET_KEY=${{ secrets.SECRET_KEY }}" >> .env
+            
+            # 拉取新镜像
+            docker compose -f docker-compose.prod.yml pull
+            
+            # 停止旧容器并启动新容器
+            docker compose -f docker-compose.prod.yml down
+            docker compose -f docker-compose.prod.yml up -d
+            
+            # 执行数据库迁移
+            docker compose -f docker-compose.prod.yml exec -T backend alembic upgrade head
+            
+            # 清理旧镜像
+            docker image prune -f
+
+      - name: 验证部署
+        run: |
+          sleep 30
+          curl -f https://staging.yourdomain.com/health || exit 1
+
+  # 部署到 Production
+  deploy-production:
+    name: 部署到 Production
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-staging]
+    if: github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://yourdomain.com
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 部署到服务器
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ secrets.PRODUCTION_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_KEY }}
+          script: |
+            cd /opt/exam-system
+            
+            # 备份数据库
+            docker compose -f docker-compose.prod.yml exec -T db mysqldump -u root -p${{ secrets.MYSQL_ROOT_PASSWORD }} exam_system > backup_$(date +%Y%m%d_%H%M%S).sql
+            
+            # 拉取最新代码
+            git pull origin main
+            
+            # 更新环境变量
+            echo "VERSION=${{ needs.build-and-push.outputs.version }}" > .env
+            echo "DOMAIN=yourdomain.com" >> .env
+            echo "MYSQL_ROOT_PASSWORD=${{ secrets.MYSQL_ROOT_PASSWORD }}" >> .env
+            echo "MYSQL_USER=${{ secrets.MYSQL_USER }}" >> .env
+            echo "MYSQL_PASSWORD=${{ secrets.MYSQL_PASSWORD }}" >> .env
+            echo "SECRET_KEY=${{ secrets.SECRET_KEY }}" >> .env
+            
+            # 拉取新镜像
+            docker compose -f docker-compose.prod.yml pull
+            
+            # 停止旧容器并启动新容器
+            docker compose -f docker-compose.prod.yml down
+            docker compose -f docker-compose.prod.yml up -d
+            
+            # 执行数据库迁移
+            docker compose -f docker-compose.prod.yml exec -T backend alembic upgrade head
+            
+            # 清理旧镜像
+            docker image prune -f
+
+      - name: 验证部署
+        run: |
+          sleep 30
+          curl -f https://yourdomain.com/health || exit 1
+
+  # 发送通知
+  notify:
+    name: 发送部署通知
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+
+    steps:
+      - name: 发送 Slack 通知
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            部署 ${{ needs.build-and-push.outputs.version }} 到 ${{ github.event.inputs.environment || 'staging' }}:
+            状态: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

@@ -1,0 +1,50 @@
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+env
+.env
+
+# 测试
+.pytest_cache
+.coverage
+htmlcov
+tests
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# 版本控制
+.git
+.gitignore
+
+# 上传文件
+uploads/*
+
+# 日志
+*.log
+
+# Docker
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# 文档
+README.md
+CHANGELOG.md
+LICENSE
+
+# 数据库
+*.db
+*.sqlite3
+
+# 临时文件
+tmp
+temp

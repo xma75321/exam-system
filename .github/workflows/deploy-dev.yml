@@ -1,0 +1,95 @@
+name: 部署测试环境
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  APP_DIR: /opt/app/exam-system
+
+jobs:
+  deploy-dev:
+    name: 部署到测试环境
+    runs-on: ubuntu-latest
+    environment:
+      name: development
+      url: http://45.32.17.107
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 部署到服务器
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          port: ${{ secrets.SERVER_PORT }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            
+            echo "=========================================="
+            echo "开始部署测试环境"
+            echo "=========================================="
+            
+            # 进入项目目录
+            cd ${{ env.APP_DIR }}
+            
+            # 拉取最新代码
+            echo "[1/5] 拉取最新代码..."
+            git fetch origin
+            git checkout develop
+            git pull origin develop
+            
+            # 显示当前版本
+            echo "[2/5] 当前版本: $(git log --oneline -1)"
+            
+            # 构建 Docker 镜像
+            echo "[3/5] 构建 Docker 镜像..."
+            docker compose build --no-cache
+            
+            # 执行数据库迁移
+            echo "[4/5] 执行数据库迁移..."
+            docker compose run --rm backend alembic upgrade head || true
+            
+            # 启动服务
+            echo "[5/5] 启动服务..."
+            docker compose up -d
+            
+            # 等待服务启动
+            echo "等待服务启动..."
+            sleep 15
+            
+            # 验证服务状态
+            echo "=========================================="
+            echo "服务状态:"
+            docker compose ps
+            
+            # 健康检查
+            echo ""
+            echo "健康检查:"
+            curl -sf http://localhost:8000/health && echo " [OK] Backend" || echo " [FAIL] Backend"
+            curl -sf http://localhost:3000 && echo " [OK] Frontend" || echo " [FAIL] Frontend"
+            
+            # 清理旧镜像
+            echo ""
+            echo "清理旧镜像..."
+            docker image prune -f
+            
+            echo "=========================================="
+            echo "测试环境部署完成!"
+            echo "=========================================="
+
+      - name: 部署结果通知
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ 测试环境部署成功"
+            echo "访问地址: http://${{ secrets.SERVER_HOST }}"
+          else
+            echo "❌ 测试环境部署失败"
+          fi
