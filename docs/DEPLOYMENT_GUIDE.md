@@ -1,48 +1,51 @@
-# CI/CD 部署指南与踩坑记录
+# 部署实战指南
 
-> 本文档记录部署过程中遇到的问题和解决方案，**下次部署前请先阅读本文档**。
-
----
-
-## 一、部署前检查清单
-
-### 1.1 服务器准备
-- [ ] Docker 已安装（版本 ≥ 20.10）
-- [ ] Docker Compose 已安装（版本 ≥ 2.0）
-- [ ] 防火墙已开放端口：22（SSH）、80（HTTP）、443（HTTPS）
-- [ ] SSH 已配置密钥登录（推荐）
-
-### 1.2 代码准备
-- [ ] `.gitignore` 已配置（排除 `.env`、`node_modules`、`__pycache__`、`uploads/`）
-- [ ] `frontend/public/` 目录存在（即使为空，添加 `.gitkeep`）
-- [ ] 敏感信息不提交到 Git
-
-### 1.3 Docker 配置检查
-- [ ] `docker-compose.yml` 包含完整配置：
-  - `ports`：端口映射
-  - `volumes`：数据持久化
-  - `healthcheck`：健康检查
-  - `depends_on`：启动顺序
-  - `networks`：容器通信
-- [ ] `Dockerfile` 使用非 root 用户
-- [ ] 健康检查配置合理
+> 基于实际部署经验编写，记录所有踩过的坑。**部署前必读**。
 
 ---
 
-## 二、常见问题与解决方案
+## 一、架构概览
 
-### 2.1 Next.js 环境变量问题 ⚠️ 重要
+```
+浏览器
+  ↓
+Nginx (80)
+  ├── /_next/* → 前端 (3000)
+  └── /api/*   → 后端 (8000)
+                  ↓
+                MySQL (3306)
+```
 
-**问题**：`NEXT_PUBLIC_*` 变量在运行时设置无效
+**技术栈**：
+- 前端：Next.js 14 + TypeScript
+- 后端：FastAPI + SQLAlchemy
+- 数据库：MySQL 8.0
+- 部署：Docker Compose + GitHub Actions
 
-**原因**：Next.js 的 `NEXT_PUBLIC_*` 变量在**构建时**嵌入代码，不是运行时
+---
 
-**解决方案**：
+## 二、必须避免的 8 个坑
+
+### 坑 1：Next.js 环境变量不生效 ⚠️ 最常见
+
+**现象**：前端请求 `http://localhost:8000/api`，浏览器报 `Failed to fetch`
+
+**原因**：`NEXT_PUBLIC_*` 变量在**构建时**注入，不是运行时
+
+**错误做法**：
+```yaml
+# ❌ 只在运行时设置，构建时没有
+frontend:
+  environment:
+    NEXT_PUBLIC_API_URL: http://45.32.17.107/api
+```
+
+**正确做法**：
 ```dockerfile
 # Dockerfile.frontend
-ARG NEXT_PUBLIC_API_URL
-ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
-RUN npm run build
+ARG NEXT_PUBLIC_API_URL          # 声明构建参数
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}  # 设置环境变量
+RUN npm run build                # 构建时注入
 ```
 
 ```yaml
@@ -50,55 +53,75 @@ RUN npm run build
 frontend:
   build:
     args:
-      NEXT_PUBLIC_API_URL: http://${DOMAIN}/api
+      NEXT_PUBLIC_API_URL: http://${DOMAIN}/api  # 传递构建参数
   environment:
-    NEXT_PUBLIC_API_URL: http://${DOMAIN}/api  # 运行时也需要
+    NEXT_PUBLIC_API_URL: http://${DOMAIN}/api    # 运行时也需要
 ```
 
 **验证方法**：
 ```bash
 docker exec <container> printenv NEXT_PUBLIC_API_URL
+# 应输出：http://45.32.17.107/api
 ```
 
 ---
 
-### 2.2 Shell 变量转义问题
+### 坑 2：密码中的特殊字符被转义
 
-**问题**：密码中的 `$`、`!` 等特殊字符被 Shell 解释
+**现象**：数据库连接失败，日志显示 `Access denied`
+
+**原因**：Shell 将 `$`、`!` 等字符解释为变量
 
 **错误示例**：
 ```bash
-MYSQL_PASSWORD=MyP@ss$word  # $word 被解释为变量
+MYSQL_PASSWORD=MyP@ss$word  # $word 被解释为变量，实际密码变成 MyP@ss
 ```
 
-**解决方案**：
+**正确做法**：
 ```bash
-# 方案 1：使用单引号
-MYSQL_PASSWORD='MyP@ss$word'
-
-# 方案 2：避免特殊字符（推荐）
+# 方案 1：避免特殊字符（推荐）
 MYSQL_PASSWORD=MyPAssword123
+
+# 方案 2：使用单引号
+MYSQL_PASSWORD='MyP@ss$word'
 
 # 方案 3：使用双引号并转义
 MYSQL_PASSWORD="MyP@ss\$word"
 ```
 
+**经验**：生成密码时只使用字母和数字，避免 `$`、`!`、`#`、`&` 等字符
+
 ---
 
-### 2.3 CORS 配置不一致
+### 坑 3：CORS 配置不一致
 
-**问题**：前端请求被 CORS 策略阻止
+**现象**：浏览器报 `CORS policy blocked`，但 curl 测试正常
+
+**原因**：前端 Origin 与后端 CORS_ORIGINS 不匹配
 
 **排查步骤**：
-1. 检查浏览器控制台错误信息
-2. 确认前端 Origin 与后端 CORS_ORIGINS 匹配
-3. 测试 OPTIONS 预检请求
+```bash
+# 1. 检查前端 Origin
+# 浏览器访问 http://45.32.17.107，Origin 就是 http://45.32.17.107
 
-**解决方案**：
+# 2. 检查后端 CORS_ORIGINS
+docker exec backend printenv CORS_ORIGINS
+
+# 3. 测试 OPTIONS 预检请求
+curl -X OPTIONS -H "Origin: http://45.32.17.107" \
+  -H "Access-Control-Request-Method: POST" \
+  http://localhost/api/auth/register -v
+```
+
+**正确配置**：
+```yaml
+# docker-compose.yml
+environment:
+  CORS_ORIGINS: '["http://${DOMAIN}","http://localhost:3000"]'
+```
+
 ```python
 # backend/app/config.py
-CORS_ORIGINS: list[str] = ["http://localhost:3000"]
-
 @field_validator("CORS_ORIGINS", mode="before")
 @classmethod
 def parse_cors_origins(cls, v):
@@ -107,89 +130,54 @@ def parse_cors_origins(cls, v):
     return v
 ```
 
-```yaml
-# docker-compose.yml
-environment:
-  CORS_ORIGINS: '["http://${DOMAIN}","http://localhost:3000"]'
+**关键点**：
+- `http` vs `https` 必须一致
+- 域名/IP 必须完全匹配
+- JSON 格式必须正确
+
+---
+
+### 坑 4：entrypoint.sh 语法错误
+
+**现象**：后端容器启动失败，日志显示 `syntax error near unexpected token`
+
+**原因**：使用多行 Python heredoc 导致 Shell 解析失败
+
+**错误示例**：
+```bash
+#!/bin/bash
+python << 'EOF'
+import something
+if condition:
+    do_something()  # ❌ Shell 无法正确解析
+EOF
+```
+
+**正确做法**：
+```bash
+#!/bin/bash
+# 使用单行 Python 命令
+python -c "import something; do_something() if condition else None"
+
+# 或者写成 Python 脚本文件
+python /app/scripts/init.py
 ```
 
 **验证方法**：
 ```bash
-# 测试 CORS 预检
-curl -X OPTIONS -H "Origin: http://your-domain.com" \
-  -H "Access-Control-Request-Method: POST" \
-  http://localhost/api/auth/register -v
+bash -n entrypoint.sh  # 检查语法
 ```
 
 ---
 
-### 2.4 Nginx 配置问题
+### 坑 5：端口映射缺失
 
-**问题**：Nginx 无法启动或代理失败
+**现象**：容器运行正常，但外部无法访问
 
-**常见原因**：
-1. 配置文件路径错误
-2. SSL 参数文件缺失
-3. 端口冲突
+**原因**：`docker-compose.yml` 没有配置 `ports`
 
-**解决方案**：
+**正确配置**：
 ```yaml
-# docker-compose.yml
-nginx:
-  volumes:
-    - ./docker/nginx.prod.conf:/etc/nginx/nginx.conf:ro
-  # 移除 SSL 参数挂载（如果不需要）
-```
-
-**验证方法**：
-```bash
-# 检查 Nginx 配置
-docker exec nginx nginx -t
-
-# 查看 Nginx 日志
-docker logs nginx
-```
-
----
-
-### 2.5 数据库连接问题
-
-**问题**：后端无法连接数据库
-
-**排查步骤**：
-1. 检查数据库容器是否健康
-2. 检查环境变量是否正确
-3. 检查网络配置
-
-**解决方案**：
-```yaml
-# docker-compose.yml
-backend:
-  environment:
-    DATABASE_URL: mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@db:3306/${MYSQL_DATABASE}
-  depends_on:
-    db:
-      condition: service_healthy  # 等待数据库健康
-```
-
-**验证方法**：
-```bash
-# 检查数据库健康状态
-docker inspect db --format="{{.State.Health.Status}}"
-
-# 测试数据库连接
-docker exec backend python -c "from app.database import engine; print(engine.connect())"
-```
-
----
-
-### 2.6 端口映射缺失
-
-**问题**：容器运行但外部无法访问
-
-**解决方案**：
-```yaml
-# docker-compose.yml
 services:
   frontend:
     ports:
@@ -203,15 +191,24 @@ services:
       - "443:443"
 ```
 
+**验证方法**：
+```bash
+# 检查端口监听
+netstat -tlnp | grep -E ':(80|443|3000|8000)'
+
+# 检查容器端口
+docker ps --format "table {{.Names}}\t{{.Ports}}"
+```
+
 ---
 
-### 2.7 文件/目录缺失
+### 坑 6：文件/目录缺失
 
-**问题**：Docker COPY 失败
+**现象**：Docker 构建失败，`COPY failed: file not found`
 
 **常见缺失**：
-- `frontend/public/` 目录
-- `frontend/package-lock.json`
+- `frontend/public/` 目录（Next.js 需要）
+- `frontend/package-lock.json`（npm ci 需要）
 - 配置文件
 
 **解决方案**：
@@ -220,8 +217,65 @@ services:
 mkdir -p frontend/public
 touch frontend/public/.gitkeep
 
-# 确保 package-lock.json 存在
+# 生成 package-lock.json
 cd frontend && npm install
+
+# 提交到 Git
+git add frontend/public/.gitkeep frontend/package-lock.json
+```
+
+---
+
+### 坑 7：Nginx 配置问题
+
+**现象**：Nginx 容器启动失败或代理无效
+
+**常见原因**：
+1. 配置文件路径错误
+2. SSL 参数文件缺失
+3. 语法错误
+
+**解决方案**：
+```yaml
+# docker-compose.yml
+nginx:
+  volumes:
+    - ./docker/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+  # 不要挂载不存在的 SSL 文件
+```
+
+**验证方法**：
+```bash
+# 检查配置语法
+docker exec nginx nginx -t
+
+# 查看错误日志
+docker logs nginx
+```
+
+---
+
+### 坑 8：数据库健康检查配置错误
+
+**现象**：后端启动时报 `Connection refused`，但数据库容器已运行
+
+**原因**：数据库还在初始化，后端就开始连接了
+
+**正确配置**：
+```yaml
+# docker-compose.yml
+db:
+  healthcheck:
+    test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 30s
+
+backend:
+  depends_on:
+    db:
+      condition: service_healthy  # 等待数据库健康
 ```
 
 ---
@@ -229,29 +283,41 @@ cd frontend && npm install
 ## 三、部署流程
 
 ### 3.1 首次部署
+
 ```bash
-# 1. 克隆代码
-git clone <repo-url> /opt/app/exam-system
+# 1. 准备服务器
+ssh root@your-server-ip
+apt update && apt install -y docker.io docker-compose-plugin
+
+# 2. 克隆代码
+git clone https://github.com/your-username/exam-system.git /opt/app/exam-system
 cd /opt/app/exam-system
 
-# 2. 配置环境变量
+# 3. 配置环境变量
 cp .env.example .env
-vim .env  # 修改密码、域名等
+vim .env
+# 修改以下内容：
+# - MYSQL_ROOT_PASSWORD（避免特殊字符）
+# - MYSQL_PASSWORD（避免特殊字符）
+# - SECRET_KEY
+# - DOMAIN（你的域名或 IP）
 
-# 3. 构建并启动
+# 4. 构建并启动
 docker compose -f docker-compose.prod.yml up -d --build
 
-# 4. 检查状态
+# 5. 检查状态
 docker compose -f docker-compose.prod.yml ps
 docker compose -f docker-compose.prod.yml logs -f
 ```
 
 ### 3.2 更新部署
+
 ```bash
 # 1. 拉取最新代码
+cd /opt/app/exam-system
 git pull origin main
 
-# 2. 重新构建（如果有 Dockerfile 变更）
+# 2. 重新构建（如果有 Dockerfile 或依赖变更）
 docker compose -f docker-compose.prod.yml up -d --build
 
 # 3. 仅重启（如果只是代码变更）
@@ -259,117 +325,266 @@ docker compose -f docker-compose.prod.yml up -d
 ```
 
 ### 3.3 回滚部署
+
 ```bash
 # 1. 查看历史版本
-git log --oneline
+git log --oneline -10
 
 # 2. 回滚到指定版本
 git checkout <commit-hash>
 
 # 3. 重新构建
 docker compose -f docker-compose.prod.yml up -d --build
+
+# 4. 验证
+docker compose -f docker-compose.prod.yml ps
 ```
 
 ---
 
-## 四、排查命令速查
+## 四、部署后验证清单
 
-### 容器状态
+### 4.1 容器状态检查
+
+```bash
+# 所有容器应该为 "Up" 状态
+docker compose -f docker-compose.prod.yml ps
+
+# 检查健康状态
+docker inspect exam-backend-prod --format="{{.State.Health.Status}}"
+docker inspect exam-frontend-prod --format="{{.State.Health.Status}}"
+docker inspect exam-db-prod --format="{{.State.Health.Status}}"
+```
+
+### 4.2 API 连通性测试
+
+```bash
+# 后端健康检查
+curl http://localhost:8000/health
+# 期望输出：{"status":"ok"}
+
+# 通过 Nginx 测试
+curl http://localhost/api/health
+# 期望输出：{"status":"ok"}
+
+# 测试注册接口
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"username":"test","email":"test@test.com","password":"test123"}' \
+  http://localhost/api/auth/register
+# 期望输出：{"code":0,"data":{...},"message":"注册成功"}
+```
+
+### 4.3 CORS 测试
+
+```bash
+# 测试预检请求
+curl -X OPTIONS -H "Origin: http://your-domain.com" \
+  -H "Access-Control-Request-Method: POST" \
+  http://localhost/api/auth/register -v
+# 期望输出：HTTP/1.1 200 OK，包含 CORS 头
+```
+
+### 4.4 前端测试
+
+```bash
+# 检查前端页面加载
+curl -s http://localhost:3000 | head -5
+# 期望输出：HTML 内容
+
+# 检查环境变量注入
+docker exec exam-frontend-prod printenv NEXT_PUBLIC_API_URL
+# 期望输出：http://your-domain/api
+```
+
+### 4.5 浏览器测试
+
+1. 清除浏览器缓存（Ctrl + Shift + Delete）
+2. 或使用隐身模式（Ctrl + Shift + N）
+3. 访问 http://your-domain
+4. 按 F12 打开开发者工具
+5. 检查 Console 标签是否有错误
+6. 测试注册/登录功能
+
+---
+
+## 五、问题排查速查表
+
+### 5.1 容器相关
+
 ```bash
 # 查看所有容器
 docker ps -a
 
-# 查看容器健康状态
-docker inspect <container> --format="{{.State.Health.Status}}"
+# 查看容器日志
+docker logs <container-name>
+docker logs --tail=100 <container-name>
+docker logs -f <container-name>  # 实时查看
+
+# 进入容器调试
+docker exec -it <container-name> sh
+
+# 查看容器环境变量
+docker exec <container-name> printenv
 
 # 查看容器资源使用
 docker stats
 ```
 
-### 日志查看
+### 5.2 网络相关
+
 ```bash
-# 查看所有服务日志
-docker compose -f docker-compose.prod.yml logs -f
+# 检查端口监听
+netstat -tlnp | grep -E ':(80|443|3000|8000)'
 
-# 查看指定服务日志
-docker compose -f docker-compose.prod.yml logs -f backend
+# 测试内部连通性
+docker exec backend ping db
+docker exec nginx curl http://backend:8000/health
 
-# 查看最近 100 行
-docker compose -f docker-compose.prod.yml logs --tail=100 backend
+# 查看 Docker 网络
+docker network ls
+docker network inspect exam-system_exam-network
 ```
 
-### 网络测试
+### 5.3 数据库相关
+
 ```bash
-# 测试 API 连通性
-curl -s http://localhost:8000/health
+# 进入数据库
+docker exec -it exam-db-prod mysql -u root -p
 
-# 测试 CORS
-curl -X OPTIONS -H "Origin: http://your-domain.com" \
-  -H "Access-Control-Request-Method: POST" \
-  http://localhost/api/auth/register -v
+# 查看数据库日志
+docker logs exam-db-prod
 
-# 测试数据库连接
-docker exec backend python -c "from app.database import engine; print(engine.connect())"
-```
-
-### 环境变量检查
-```bash
-# 查看容器环境变量
-docker exec <container> printenv
-
-# 查看指定变量
-docker exec <container> printenv NEXT_PUBLIC_API_URL
+# 检查数据库健康状态
+docker inspect exam-db-prod --format="{{.State.Health.Status}}"
 ```
 
 ---
 
-## 五、最佳实践
+## 六、环境变量参考
 
-### 5.1 环境变量管理
-- 使用 `.env.example` 作为模板
-- 不同环境使用不同的 `.env` 文件
-- 敏感信息不提交到 Git
+### .env 文件模板
 
-### 5.2 Docker 镜像优化
-- 使用多阶段构建
-- 使用非 root 用户
-- 合理设置健康检查
+```bash
+# 数据库配置
+MYSQL_ROOT_PASSWORD=your_root_password_here
+MYSQL_USER=exam_user
+MYSQL_PASSWORD=your_password_here
+MYSQL_DATABASE=exam_system
 
-### 5.3 日志管理
-- 配置日志轮转
-- 集中收集日志
-- 设置告警规则
+# 应用配置
+SECRET_KEY=your_secret_key_here
+DOMAIN=your-domain.com  # 或 IP 地址，如 45.32.17.107
 
-### 5.4 备份策略
-- 数据库定期备份
-- 重要配置文件备份
-- 测试恢复流程
+# CORS 配置（可选，默认自动生成）
+# CORS_ORIGINS=["http://your-domain.com","http://localhost:3000"]
+```
+
+### 关键点
+
+- **密码**：只使用字母和数字，避免 `$`、`!`、`#`、`&`
+- **DOMAIN**：填写域名或 IP，不要加 `http://`
+- **SECRET_KEY**：使用随机字符串，至少 32 位
 
 ---
 
-## 六、常见错误码
+## 七、GitHub Actions CI/CD
 
-| 错误码 | 含义 | 可能原因 |
+### 7.1 工作流程
+
+```
+push to develop → 自动部署到测试环境
+push to main    → 需要审批 → 部署到生产环境
+```
+
+### 7.2 必需的 Secrets
+
+在 GitHub 仓库设置中配置：
+
+```
+Settings → Secrets and variables → Actions → New repository secret
+```
+
+需要添加：
+- `SERVER_HOST`：服务器 IP
+- `SERVER_USER`：SSH 用户名
+- `SERVER_PASSWORD`：SSH 密码
+- `MYSQL_ROOT_PASSWORD`：与服务器 .env 一致
+- `MYSQL_PASSWORD`：与服务器 .env 一致
+- `SECRET_KEY`：与服务器 .env 一致
+
+### 7.3 环境审批
+
+生产环境部署需要审批：
+
+```
+Settings → Environments → production → Required reviewers
+```
+
+添加审批人，每次部署 main 分支时需要审批。
+
+---
+
+## 八、常见错误码
+
+| 错误码 | 含义 | 排查方向 |
 |--------|------|----------|
-| 400 | 请求参数错误 | 请求体格式错误 |
-| 401 | 未认证 | Token 无效或过期 |
-| 403 | 无权限 | CORS 策略阻止 |
-| 404 | 资源不存在 | 路径错误或服务未启动 |
-| 500 | 服务器内部错误 | 后端代码异常 |
-| 502 | 网关错误 | 后端服务未启动 |
-| 503 | 服务不可用 | 容器未启动或健康检查失败 |
+| 400 | 请求参数错误 | 检查请求体格式 |
+| 401 | 未认证 | 检查 Token 是否有效 |
+| 403 | 无权限 | 检查 CORS 配置 |
+| 404 | 资源不存在 | 检查路由配置 |
+| 500 | 服务器错误 | 查看后端日志 |
+| 502 | 网关错误 | 后端容器未启动 |
+| 503 | 服务不可用 | 容器健康检查失败 |
 
 ---
 
-## 七、联系方式
+## 九、性能优化建议
+
+### 9.1 Docker 镜像优化
+
+```dockerfile
+# 使用多阶段构建
+FROM node:22-alpine AS builder
+# ... 构建阶段
+
+FROM node:22-alpine AS runner
+# ... 运行阶段，只复制必要文件
+```
+
+### 9.2 日志管理
+
+```yaml
+# docker-compose.yml
+services:
+  backend:
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+```
+
+### 9.3 数据备份
+
+```bash
+# 备份数据库
+docker exec exam-db-prod mysqldump -u root -p exam_system > backup.sql
+
+# 恢复数据库
+docker exec -i exam-db-prod mysql -u root -p exam_system < backup.sql
+```
+
+---
+
+## 十、联系与支持
 
 遇到问题时：
 1. 先查看本文档
-2. 检查日志：`docker compose logs -f`
+2. 检查容器日志：`docker compose logs -f`
 3. 搜索错误信息
-4. 联系运维人员
+4. 提交 GitHub Issue
 
 ---
 
 **最后更新**：2026-05-31
-**维护人**：DevOps Team
+**基于实际部署经验编写**
