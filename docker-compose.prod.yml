@@ -44,7 +44,7 @@ services:
     environment:
       DATABASE_URL: mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@db:3306/${MYSQL_DATABASE:-exam_system}
       SECRET_KEY: ${SECRET_KEY}
-      CORS_ORIGINS: '["https://${DOMAIN}","http://localhost:3000"]'
+      CORS_ORIGINS: '["http://${DOMAIN}","https://${DOMAIN}","http://localhost:3000"]'
     depends_on:
       db:
         condition: service_healthy
